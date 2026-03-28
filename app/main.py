@@ -11,6 +11,7 @@ import time
 import torch
 import soundfile as sf
 import subprocess
+import re
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
@@ -112,6 +113,112 @@ def encode_audio(
     return buffer
 
 
+def smart_chunk_text(
+    text: str,
+    max_chars: int = 500,
+    min_sentences: int = 2,
+    max_sentences: int = 3,
+) -> List[str]:
+    """
+    Split text into chunks respecting natural boundaries.
+
+    Groups 2-3 sentences together for optimal:
+    - Memory usage (prevents OOM on long texts)
+    - Audio quality (better prosody on shorter segments)
+    - Natural boundaries (respects paragraphs and sentences)
+
+    Args:
+        text: Input text to chunk
+        max_chars: Maximum characters per chunk (default 500)
+        min_sentences: Minimum sentences per chunk (default 2)
+        max_sentences: Maximum sentences per chunk (default 3)
+
+    Returns:
+        List of text chunks
+    """
+    if not text or not text.strip():
+        return []
+
+    # If text is small enough, return as-is
+    text_stripped = text.strip()
+    if len(text_stripped) <= max_chars:
+        return [text_stripped]
+
+    # Split into paragraphs first (prefer paragraph boundaries)
+    paragraphs = re.split(r'\n\s*\n', text)
+
+    chunks = []
+    current_chunk = []
+    current_sentences = 0
+    current_length = 0
+
+    for para in paragraphs:
+        # Normalize whitespace within each paragraph (preserves paragraph structure)
+        para = ' '.join(para.split())
+        if not para:
+            continue
+
+        # Split paragraph into sentences
+        # Regex handles: . ! ? followed by space or end, respects quotes
+        sentences = re.split(
+            r'(?<=[.!?])\s+(?=[A-Z"\'\u4e00-\u9fff])|(?<=[.!?])$',
+            para
+        )
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+        for sentence in sentences:
+            sent_len = len(sentence)
+
+            # Fallback for sentences longer than max_chars to prevent OOM
+            if sent_len > max_chars:
+                # Flush current chunk first
+                if current_chunk:
+                    chunks.append(' '.join(current_chunk))
+                    current_chunk = []
+                    current_sentences = 0
+                    current_length = 0
+
+                # Split the long sentence into max_chars chunks
+                for i in range(0, sent_len, max_chars):
+                    chunks.append(sentence[i:i+max_chars])
+                continue
+
+            # Check if adding this sentence would exceed limits
+            would_exceed_chars = current_length + sent_len + (1 if current_chunk else 0) > max_chars
+            would_exceed_sentences = current_sentences >= max_sentences
+
+            # Decide whether to flush current chunk
+            should_flush = False
+
+            if would_exceed_chars and current_chunk:
+                should_flush = True
+            elif would_exceed_sentences and current_sentences >= min_sentences:
+                should_flush = True
+
+            if should_flush:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = []
+                current_sentences = 0
+                current_length = 0
+
+            current_chunk.append(sentence)
+            current_sentences += 1
+            current_length += sent_len + (1 if len(current_chunk) > 1 else 0)
+
+        # After each paragraph, consider flushing if we have min_sentences
+        if current_sentences >= min_sentences:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = []
+            current_sentences = 0
+            current_length = 0
+
+    # Don't forget remaining sentences
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+
+    return chunks
+
+
 class TTSRequest(BaseModel):
     """TTS generation request."""
     text: str = Field(..., description="Text to synthesize", min_length=1)
@@ -197,7 +304,8 @@ async def root():
         "name": "Qwen3-TTS API",
         "model": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
         "endpoints": {
-            "/tts": "Generate speech with predefined speaker",
+            "/tts": "Generate speech with predefined speaker (auto-chunking for long text)",
+            "/tts/batch": "Batch generate multiple texts",
             "/tts/clone": "Generate speech with cloned voice",
             "/voices": "List available speakers",
             "/languages": "List supported languages",
@@ -238,30 +346,48 @@ async def generate_speech(request: TTSRequest):
     """
     Generate speech from text using predefined speaker.
 
-    - **text**: Text to synthesize (required)
+    Automatically handles long texts by chunking into 2-3 sentence
+    segments for optimal memory usage and audio quality.
+
+    - **text**: Text to synthesize (required, any length supported)
     - **language**: Output language (default: Auto)
     - **speaker**: Voice speaker (default: Ryan)
     - **instructions**: Style/emotion instructions (optional)
-    - **audio_format**: Output format (default: wav)
+    - **audio_format**: Output format (default: mp3)
     """
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     try:
+        # Smart chunk text for long inputs
+        chunks = smart_chunk_text(request.text)
+
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No text to synthesize")
+
         gen_start = time.time()
-        wavs, sr = model.generate_custom_voice(
-            text=request.text,
-            language=request.language.value,
-            speaker=request.speaker.value,
-            instruct=request.instructions or "",
-        )
+
+        # Generate audio for each chunk
+        all_wavs = []
+        sr = None
+
+        for chunk in chunks:
+            wavs, sr = model.generate_custom_voice(
+                text=chunk,
+                language=request.language.value,
+                speaker=request.speaker.value,
+                instruct=request.instructions or "",
+            )
+            all_wavs.extend(wavs)
+
         gen_time = time.time() - gen_start
 
-        # Calculate stats
-        audio_duration = len(wavs[0]) / sr
+        # Concatenate all audio
+        combined = np.concatenate(all_wavs)
+        audio_duration = len(combined) / sr
 
         # Convert to bytes (supports WAV, MP3, FLAC)
-        buffer = encode_audio(wavs[0], sr, request.audio_format)
+        buffer = encode_audio(combined, sr, request.audio_format)
 
         # Set content type
         content_types = {
@@ -275,6 +401,7 @@ async def generate_speech(request: TTSRequest):
             "X-Audio-Duration": f"{audio_duration:.2f}",
             "X-Real-Time-Factor": f"{audio_duration/gen_time:.2f}",
             "X-Characters": str(len(request.text)),
+            "X-Chunks": str(len(chunks)),
         }
 
         return StreamingResponse(
@@ -302,7 +429,7 @@ async def generate_speech_batch(
     - **languages**: Comma-separated languages or single language for all
     - **speakers**: Comma-separated speakers or single speaker for all
     - **instructions**: Comma-separated instructions or single for all
-    - **audio_format**: Output format (default: wav)
+    - **audio_format**: Output format (default: mp3)
     """
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
@@ -375,7 +502,7 @@ async def generate_speech_clone(
     - **ref_audio**: Reference audio file for voice cloning
     - **ref_text**: Transcript of reference audio (improves quality)
     - **language**: Output language (default: Auto)
-    - **audio_format**: Output format (default: wav)
+    - **audio_format**: Output format (default: mp3)
     """
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
