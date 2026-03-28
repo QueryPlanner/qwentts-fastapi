@@ -14,6 +14,7 @@ import subprocess
 import re
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -294,6 +295,15 @@ app = FastAPI(
     description="Text-to-Speech API using Qwen3-TTS 0.6B model",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+# Allow all requests (CORS)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
