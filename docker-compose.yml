@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  qwentts-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: qwentts-fastapi
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist model cache to avoid re-downloading
+      - model-cache:/app/models
+    environment:
+      # Set device (cuda, mps, cpu, auto)
+      - DEVICE=auto
+    restart: unless-stopped
+    # GPU support (uncomment if using NVIDIA GPU)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  model-cache:
