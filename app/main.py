@@ -10,6 +10,8 @@ import io
 import time
 import torch
 import soundfile as sf
+import subprocess
+import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -53,13 +55,70 @@ class AudioFormat(str, Enum):
     FLAC = "flac"
 
 
+def encode_audio(
+    audio: np.ndarray,
+    sample_rate: int,
+    audio_format: AudioFormat,
+) -> io.BytesIO:
+    """
+    Encode audio array to bytes in the specified format.
+
+    Args:
+        audio: NumPy array of audio samples
+        sample_rate: Sample rate in Hz
+        audio_format: Output format (WAV, MP3, or FLAC)
+
+    Returns:
+        BytesIO buffer containing encoded audio
+
+    Note:
+        MP3 encoding uses ffmpeg (must be installed).
+        WAV and FLAC use soundfile directly.
+    """
+    buffer = io.BytesIO()
+
+    if audio_format == AudioFormat.MP3:
+        # MP3 requires ffmpeg transcoding
+        # First write to WAV, then convert to MP3
+        wav_buffer = io.BytesIO()
+        sf.write(wav_buffer, audio, sample_rate, format='WAV')
+        wav_buffer.seek(0)
+
+        # Use ffmpeg to convert WAV to MP3
+        process = subprocess.run(
+            [
+                'ffmpeg', '-y',
+                '-i', 'pipe:0',
+                '-codec:a', 'libmp3lame',
+                '-qscale:a', '2',  # ~190kbps, good quality for speech
+                '-f', 'mp3',
+                'pipe:1'
+            ],
+            input=wav_buffer.read(),
+            capture_output=True,
+        )
+
+        if process.returncode != 0:
+            raise RuntimeError(f"FFmpeg MP3 encoding failed: {process.stderr.decode()}")
+
+        buffer.write(process.stdout)
+        buffer.seek(0)
+
+    else:
+        # WAV and FLAC are natively supported by soundfile
+        sf.write(buffer, audio, sample_rate, format=audio_format.value.upper())
+        buffer.seek(0)
+
+    return buffer
+
+
 class TTSRequest(BaseModel):
     """TTS generation request."""
     text: str = Field(..., description="Text to synthesize", min_length=1)
     language: Language = Field(Language.AUTO, description="Output language")
     speaker: Speaker = Field(Speaker.RYAN, description="Voice speaker")
     instructions: Optional[str] = Field("", description="Style/emotion instructions")
-    audio_format: AudioFormat = Field(AudioFormat.WAV, description="Output audio format")
+    audio_format: AudioFormat = Field(AudioFormat.MP3, description="Output audio format")
 
 
 class VoiceCloneRequest(BaseModel):
@@ -201,10 +260,8 @@ async def generate_speech(request: TTSRequest):
         # Calculate stats
         audio_duration = len(wavs[0]) / sr
 
-        # Convert to bytes
-        buffer = io.BytesIO()
-        sf.write(buffer, wavs[0], sr, format=request.audio_format.value.upper())
-        buffer.seek(0)
+        # Convert to bytes (supports WAV, MP3, FLAC)
+        buffer = encode_audio(wavs[0], sr, request.audio_format)
 
         # Set content type
         content_types = {
@@ -236,7 +293,7 @@ async def generate_speech_batch(
     languages: Optional[str] = Form("Auto"),
     speakers: Optional[str] = Form("Ryan"),
     instructions: Optional[str] = Form(""),
-    audio_format: AudioFormat = Form(AudioFormat.WAV),
+    audio_format: AudioFormat = Form(AudioFormat.MP3),
 ):
     """
     Batch generate speech from multiple texts.
@@ -274,14 +331,11 @@ async def generate_speech_batch(
         gen_time = time.time() - gen_start
 
         # Concatenate all audio
-        import numpy as np
         combined = np.concatenate(wavs)
         audio_duration = len(combined) / sr
 
-        # Convert to bytes
-        buffer = io.BytesIO()
-        sf.write(buffer, combined, sr, format=audio_format.value.upper())
-        buffer.seek(0)
+        # Convert to bytes (supports WAV, MP3, FLAC)
+        buffer = encode_audio(combined, sr, audio_format)
 
         content_types = {
             AudioFormat.WAV: "audio/wav",
@@ -312,7 +366,7 @@ async def generate_speech_clone(
     ref_audio: UploadFile = File(...),
     ref_text: str = Form(""),
     language: Language = Form(Language.AUTO),
-    audio_format: AudioFormat = Form(AudioFormat.WAV),
+    audio_format: AudioFormat = Form(AudioFormat.MP3),
 ):
     """
     Generate speech with cloned voice from reference audio.
@@ -351,10 +405,8 @@ async def generate_speech_clone(
 
         audio_duration = len(wavs[0]) / sr
 
-        # Convert to bytes
-        buffer = io.BytesIO()
-        sf.write(buffer, wavs[0], sr, format=audio_format.value.upper())
-        buffer.seek(0)
+        # Convert to bytes (supports WAV, MP3, FLAC)
+        buffer = encode_audio(wavs[0], sr, audio_format)
 
         content_types = {
             AudioFormat.WAV: "audio/wav",
